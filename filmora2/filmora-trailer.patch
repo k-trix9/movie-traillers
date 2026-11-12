@@ -1,0 +1,758 @@
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/package.json filmora/backend/package.json
+--- orig/backend/package.json	2026-11-11 10:40:43.661481624 +0000
++++ filmora/backend/package.json	2026-11-11 10:41:28.093934226 +0000
+@@ -12,6 +12,8 @@
+     "prisma:generate": "prisma generate",
+     "db:push": "prisma db push",
+     "db:seed": "node prisma/seed.js",
++    "trailers:backfill": "node scripts/backfill-trailers.js",
++    "catalogue:diagnose": "node scripts/diagnose-catalogue.js",
+     "test": "node --test"
+   },
+   "dependencies": {
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/scripts/backfill-trailers.js filmora/backend/scripts/backfill-trailers.js
+--- orig/backend/scripts/backfill-trailers.js	1970-01-01 00:00:00.000000000 +0000
++++ filmora/backend/scripts/backfill-trailers.js	2026-11-11 10:41:20.504826510 +0000
+@@ -0,0 +1,19 @@
++// Adds missing TMDB trailers to existing movies.
++//   node scripts/backfill-trailers.js --dry-run   (only shows what would happen)
++//   node scripts/backfill-trailers.js             (does the work)
++// It only creates/updates "trailer" rows in MovieMedia. Nothing is deleted.
++import "dotenv/config";
++import { prisma } from "../src/lib/prisma.js";
++import { backfillMissingTrailers } from "../src/services/trailer.service.js";
++
++const dryRun = process.argv.includes("--dry-run");
++
++try {
++  const summary = await backfillMissingTrailers(prisma, {
++    dryRun,
++    log: (line) => console.log(line)
++  });
++  console.log("\nSummary:", summary);
++} finally {
++  await prisma.$disconnect();
++}
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/scripts/diagnose-catalogue.js filmora/backend/scripts/diagnose-catalogue.js
+--- orig/backend/scripts/diagnose-catalogue.js	1970-01-01 00:00:00.000000000 +0000
++++ filmora/backend/scripts/diagnose-catalogue.js	2026-11-11 10:41:20.505642314 +0000
+@@ -0,0 +1,61 @@
++// READ-ONLY. Explains why each movie is (or is not) in the public catalogue.
++//   node scripts/diagnose-catalogue.js
++// It does not change anything and does not bypass any licence rule.
++import "dotenv/config";
++import { prisma } from "../src/lib/prisma.js";
++import { env } from "../src/config/env.js";
++
++try {
++  const movies = await prisma.movie.findMany({
++    include: { licenses: true, videoAssets: true, media: true },
++    orderBy: { createdAt: "asc" }
++  });
++
++  console.log(`Movies in database: ${movies.length}`);
++  console.log(`TRUST_CF_IP_COUNTRY = ${env.TRUST_CF_IP_COUNTRY} ` +
++    "(when false, only WORLDWIDE licences can appear in the public list)\n");
++
++  const now = new Date();
++  let visible = 0;
++
++  for (const movie of movies) {
++    const problems = [];
++
++    if (movie.publicationStatus !== "PUBLISHED") {
++      problems.push(`status is ${movie.publicationStatus}, not PUBLISHED`);
++    }
++
++    const goodLicense = movie.licenses.some((l) =>
++      l.status === "VERIFIED" &&
++      l.permittedDistribution &&
++      l.validFrom <= now &&
++      (!l.validUntil || l.validUntil >= now) &&
++      (env.TRUST_CF_IP_COUNTRY ? true : l.territory === "WORLDWIDE")
++    );
++
++    if (!movie.licenses.length) {
++      problems.push("no licence record");
++    } else if (!goodLicense) {
++      problems.push("no verified, in-date licence usable for visitors: " +
++        movie.licenses.map((l) =>
++          `[${l.territory} ${l.status} distribution=${l.permittedDistribution} ` +
++          `from ${l.validFrom.toISOString().slice(0, 10)}` +
++          `${l.validUntil ? ` until ${l.validUntil.toISOString().slice(0, 10)}` : ""}]`
++        ).join(" "));
++    }
++
++    const trailer = movie.media.find((m) => m.mediaType === "trailer" && m.fileUrl);
++    if (!problems.length) visible += 1;
++
++    console.log(`${problems.length ? "HIDDEN " : "VISIBLE"}  ${movie.title}` +
++      `  | trailer: ${trailer ? "yes" : "no"}`);
++    problems.forEach((p) => console.log(`           - ${p}`));
++  }
++
++  console.log(`\nVisible in public catalogue: ${visible} of ${movies.length}`);
++  if (!movies.length) {
++    console.log("The database has no movies. The seed script only creates roles, plans and the admin user.");
++  }
++} finally {
++  await prisma.$disconnect();
++}
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/src/routes/admin.routes.js filmora/backend/src/routes/admin.routes.js
+--- orig/backend/src/routes/admin.routes.js	2026-11-11 10:40:43.661889952 +0000
++++ filmora/backend/src/routes/admin.routes.js	2026-11-11 10:41:28.093394042 +0000
+@@ -8,7 +8,8 @@
+ import { HttpError } from "../lib/http-error.js";
+ import { requireAuth, requireAdministrator } from "../middleware/auth.js";
+ import { createTusUploadUrl, getCloudflareVideo } from "../services/cloudflare.service.js";
+-import { getMovieTrailer } from "../services/tmdb.service.js";
++import { TmdbError } from "../services/tmdb.service.js";
++import { importTrailerForMovie } from "../services/trailer.service.js";
+ 
+ const router = Router();
+ router.use(requireAuth, requireAdministrator);
+@@ -176,39 +177,30 @@
+     throw new HttpError(404, "Movie not found.");
+   }
+ 
+-  const trailer = await getMovieTrailer(movie.title);
++  let result;
+ 
+-  if (!trailer) {
+-    throw new HttpError(404, "No official YouTube trailer found for this movie.");
+-  }
+-
+-  const existing = await prisma.movieMedia.findFirst({
+-    where: {
+-      movieId: movie.id,
+-      mediaType: "trailer"
++  try {
++    // overwrite: true because an administrator pressed the button on purpose.
++    result = await importTrailerForMovie(prisma, movie, { overwrite: true });
++  } catch (error) {
++    if (error instanceof TmdbError) {
++      if (error.code === "NO_API_KEY") {
++        throw new HttpError(503, "TMDB is not configured. Add TMDB_API_KEY to backend/.env.");
++      }
++      if (error.code === "RATE_LIMITED") {
++        throw new HttpError(429, "TMDB rate limit reached. Please try again in a few minutes.");
++      }
++      throw new HttpError(502, "Could not get the trailer from TMDB right now. Please try again later.");
+     }
+-  });
++    throw error;
++  }
+ 
+-  const mediaData = {
+-    mediaType: "trailer",
+-    storageProvider: "external",
+-    fileUrl: trailer.url
+-  };
+-
+-  if (existing) {
+-    await prisma.movieMedia.update({
+-      where: { id: existing.id },
+-      data: mediaData
+-    });
+-  } else {
+-    await prisma.movieMedia.create({
+-      data: {
+-        movieId: movie.id,
+-        ...mediaData
+-      }
+-    });
++  if (result.status === "not_found") {
++    throw new HttpError(404, "No official YouTube trailer found for this movie.");
+   }
+ 
++  const trailer = result.trailer;
++
+   await audit(req.user.id, "movie.trailer_imported", "movie", movie.id);
+ 
+   res.json({
+@@ -255,6 +247,13 @@
+   });
+ 
+   await audit(req.user.id, "movie.created", "movie", movie.id);
++
++  // Fetch the TMDB trailer in the background. If TMDB is down or has no
++  // trailer, movie creation is not affected.
++  importTrailerForMovie(prisma, movie).catch((error) => {
++    console.warn(`Trailer import skipped for "${movie.title}": ${error.code || error.message}`);
++  });
++
+   res.status(201).json({ movie });
+ }));
+ 
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/src/services/tmdb.service.js filmora/backend/src/services/tmdb.service.js
+--- orig/backend/src/services/tmdb.service.js	2026-11-11 10:40:43.662210019 +0000
++++ filmora/backend/src/services/tmdb.service.js	2026-11-11 10:41:04.600570302 +0000
+@@ -1,55 +1,204 @@
+-
+ import { env } from "../config/env.js";
+ 
+ const TMDB_BASE_URL = "https://api.themoviedb.org/3";
++const REQUEST_TIMEOUT_MS = 8000;
+ 
+-export async function getMovieTrailer(movieTitle) {
++// Simple in-memory cache so the same title is not asked from TMDB again and again.
++// Successful lookups are kept for a day; "no trailer found" for an hour.
++// Errors (rate limit, network) are never cached.
++const FOUND_TTL_MS = 24 * 60 * 60 * 1000;
++const NOT_FOUND_TTL_MS = 60 * 60 * 1000;
++const MAX_CACHE_ENTRIES = 500;
++const cache = new Map();
++
++/**
++ * Error type for problems talking to TMDB.
++ * code is one of: NO_API_KEY, AUTH_FAILED, RATE_LIMITED, TIMEOUT, NETWORK, HTTP_ERROR
++ */
++export class TmdbError extends Error {
++  constructor(code, message, retryAfterSeconds = null) {
++    super(message);
++    this.name = "TmdbError";
++    this.code = code;
++    this.retryAfterSeconds = retryAfterSeconds;
++  }
++}
++
++export function clearTrailerCache() {
++  cache.clear();
++}
++
++async function tmdbGet(path, params = {}) {
+   if (!env.TMDB_API_KEY) {
+-    throw new Error("TMDB API key is not configured.");
++    throw new TmdbError("NO_API_KEY", "TMDB API key is not configured.");
+   }
+ 
+-  const searchUrl = new URL(`${TMDB_BASE_URL}/search/movie`);
++  const url = new URL(`${TMDB_BASE_URL}${path}`);
++  for (const [key, value] of Object.entries(params)) {
++    if (value !== undefined && value !== null && value !== "") {
++      url.searchParams.set(key, String(value));
++    }
++  }
++  url.searchParams.set("api_key", env.TMDB_API_KEY);
+ 
+-  searchUrl.searchParams.set("query", movieTitle);
+-  searchUrl.searchParams.set("api_key", env.TMDB_API_KEY);
++  let response;
++  try {
++    response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
++  } catch (error) {
++    // The message is written by us so the API key can never leak into logs.
++    throw new TmdbError(
++      error?.name === "TimeoutError" ? "TIMEOUT" : "NETWORK",
++      "Could not reach TMDB."
++    );
++  }
+ 
+-  const searchResponse = await fetch(searchUrl);
++  if (response.status === 429) {
++    const retryAfter = Number.parseInt(response.headers.get("retry-after") || "", 10);
++    throw new TmdbError(
++      "RATE_LIMITED",
++      "TMDB rate limit reached. Try again later.",
++      Number.isFinite(retryAfter) ? retryAfter : null
++    );
++  }
+ 
+-  if (!searchResponse.ok) {
+-    throw new Error(`TMDB movie search failed: ${searchResponse.status}`);
++  if (response.status === 401) {
++    throw new TmdbError("AUTH_FAILED", "TMDB rejected the API key.");
+   }
+ 
+-  const searchData = await searchResponse.json();
+-  const movie = searchData.results?.[0];
++  if (!response.ok) {
++    throw new TmdbError("HTTP_ERROR", `TMDB request failed: ${response.status}`);
++  }
++
++  return response.json();
++}
++
++// "Spider-Man: No Way Home" and "spider man no way home" become the same text.
++function normalizeTitle(value) {
++  return String(value || "")
++    .normalize("NFKD")
++    .replace(/[\u0300-\u036f]/g, "")
++    .toLowerCase()
++    .replace(/[^a-z0-9]+/g, " ")
++    .trim();
++}
+ 
+-  if (!movie) return null;
++function yearOf(dateText) {
++  const year = Number.parseInt(String(dateText || "").slice(0, 4), 10);
++  return Number.isFinite(year) ? year : null;
++}
+ 
+-  const videosUrl = new URL(
+-    `${TMDB_BASE_URL}/movie/${movie.id}/videos`
++/**
++ * Choose the correct TMDB movie from search results.
++ * - The title must match exactly (ignoring capitals and punctuation).
++ * - If we know the release year, the movie must be within 1 year of it.
++ * Anything else is treated as "no match" instead of guessing a wrong movie.
++ */
++function pickBestMatch(results, title, year) {
++  const wanted = normalizeTitle(title);
++  if (!wanted || !Array.isArray(results)) return null;
++
++  const exact = results.filter((item) =>
++    normalizeTitle(item.title) === wanted ||
++    normalizeTitle(item.original_title) === wanted
+   );
+ 
+-  videosUrl.searchParams.set("api_key", env.TMDB_API_KEY);
++  if (!year) return exact[0] || null;
+ 
+-  const videosResponse = await fetch(videosUrl);
++  return exact.find((item) => {
++    const itemYear = yearOf(item.release_date);
++    return itemYear !== null && Math.abs(itemYear - year) <= 1;
++  }) || null;
++}
+ 
+-  if (!videosResponse.ok) {
+-    throw new Error(`TMDB trailer request failed: ${videosResponse.status}`);
++async function findTmdbMovie(title, year) {
++  if (year) {
++    const withYear = await tmdbGet("/search/movie", { query: title, year });
++    const match = pickBestMatch(withYear.results, title, year);
++    if (match) return match;
+   }
+ 
+-  const videosData = await videosResponse.json();
++  const anyYear = await tmdbGet("/search/movie", { query: title });
++  return pickBestMatch(anyYear.results, title, year);
++}
+ 
+-  const trailer = videosData.results?.find(video =>
++// Official YouTube trailers first, then official YouTube teasers. Nothing else.
++function chooseVideo(videos) {
++  const usable = (Array.isArray(videos) ? videos : []).filter((video) =>
+     video.site === "YouTube" &&
+-    video.type === "Trailer" &&
+-    video.official === true
++    video.official === true &&
++    (video.type === "Trailer" || video.type === "Teaser") &&
++    /^[A-Za-z0-9_-]{11}$/.test(String(video.key || ""))
+   );
+ 
+-  if (!trailer) return null;
++  const typeRank = (video) => (video.type === "Trailer" ? 0 : 1);
+ 
+-  return {
+-    name: trailer.name,
+-    key: trailer.key,
+-    url: `https://www.youtube.com/embed/${trailer.key}`,
+-    thumbnail: `https://img.youtube.com/vi/${trailer.key}/hqdefault.jpg`
++  usable.sort((a, b) =>
++    typeRank(a) - typeRank(b) ||
++    (Number(b.size) || 0) - (Number(a.size) || 0) ||
++    String(b.published_at || "").localeCompare(String(a.published_at || ""))
++  );
++
++  return usable[0] || null;
++}
++
++function cacheGet(key) {
++  const hit = cache.get(key);
++  if (!hit) return undefined;
++  if (hit.expiresAt < Date.now()) {
++    cache.delete(key);
++    return undefined;
++  }
++  return hit.value;
++}
++
++function cacheSet(key, value) {
++  if (cache.size >= MAX_CACHE_ENTRIES) {
++    cache.delete(cache.keys().next().value);
++  }
++  cache.set(key, {
++    value,
++    expiresAt: Date.now() + (value ? FOUND_TTL_MS : NOT_FOUND_TTL_MS)
++  });
++}
++
++/**
++ * Find the official YouTube trailer (or teaser) for a movie.
++ * releaseYear is optional but strongly recommended: it prevents wrong matches.
++ * Returns null when no suitable trailer exists. Throws TmdbError on API problems.
++ */
++export async function getMovieTrailer(movieTitle, releaseYear = null) {
++  const title = String(movieTitle || "").trim();
++  if (!title) return null;
++
++  const year = Number.isInteger(releaseYear) ? releaseYear : null;
++  const cacheKey = `${normalizeTitle(title)}|${year || ""}`;
++
++  const cached = cacheGet(cacheKey);
++  if (cached !== undefined) return cached;
++
++  const movie = await findTmdbMovie(title, year);
++  if (!movie) {
++    cacheSet(cacheKey, null);
++    return null;
++  }
++
++  const videosData = await tmdbGet(`/movie/${movie.id}/videos`);
++  const video = chooseVideo(videosData.results);
++
++  if (!video) {
++    cacheSet(cacheKey, null);
++    return null;
++  }
++
++  const result = {
++    name: video.name,
++    key: video.key,
++    type: video.type,
++    tmdbId: movie.id,
++    url: `https://www.youtube.com/embed/${video.key}`,
++    thumbnail: `https://img.youtube.com/vi/${video.key}/hqdefault.jpg`
+   };
++
++  cacheSet(cacheKey, result);
++  return result;
+ }
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/src/services/trailer.service.js filmora/backend/src/services/trailer.service.js
+--- orig/backend/src/services/trailer.service.js	1970-01-01 00:00:00.000000000 +0000
++++ filmora/backend/src/services/trailer.service.js	2026-11-11 10:41:20.503995795 +0000
+@@ -0,0 +1,111 @@
++import { getMovieTrailer, TmdbError } from "./tmdb.service.js";
++
++/**
++ * Saves TMDB trailers into the existing MovieMedia table (mediaType = "trailer").
++ * The Prisma client is passed in as "db" so these functions are easy to test
++ * and never create a second database connection.
++ */
++
++export function releaseYearOf(movie) {
++  if (!movie?.releaseDate) return null;
++  const year = new Date(movie.releaseDate).getUTCFullYear();
++  return Number.isFinite(year) ? year : null;
++}
++
++/**
++ * Find and save the trailer for one movie.
++ * Returns { status, trailer? } where status is:
++ *   "created"          - a new MovieMedia row was added
++ *   "updated"          - the existing trailer row was updated (no duplicate)
++ *   "skipped_existing" - a trailer already exists and overwrite was not requested
++ *   "not_found"        - TMDB has no suitable official trailer/teaser
++ * Throws TmdbError if TMDB itself fails (missing key, rate limit, network...).
++ */
++export async function importTrailerForMovie(db, movie, { overwrite = false } = {}) {
++  const existing = await db.movieMedia.findFirst({
++    where: { movieId: movie.id, mediaType: "trailer" },
++    orderBy: { createdAt: "asc" }
++  });
++
++  if (existing?.fileUrl && !overwrite) {
++    return { status: "skipped_existing" };
++  }
++
++  const trailer = await getMovieTrailer(movie.title, releaseYearOf(movie));
++  if (!trailer) return { status: "not_found" };
++
++  const data = {
++    mediaType: "trailer",
++    storageProvider: "tmdb",
++    storageKey: trailer.key,
++    fileUrl: trailer.url
++  };
++
++  if (existing) {
++    await db.movieMedia.update({ where: { id: existing.id }, data });
++    return { status: "updated", trailer };
++  }
++
++  await db.movieMedia.create({ data: { movieId: movie.id, ...data } });
++  return { status: "created", trailer };
++}
++
++/**
++ * Add trailers to movies that do not have one yet.
++ * Goes one movie at a time with a short pause (gentle on TMDB's rate limit)
++ * and stops early on errors that would fail for every movie.
++ */
++export async function backfillMissingTrailers(db, {
++  limit = 200,
++  delayMs = 300,
++  dryRun = false,
++  log = () => {}
++} = {}) {
++  const movies = await db.movie.findMany({
++    where: {
++      media: { none: { mediaType: "trailer", fileUrl: { not: null } } }
++    },
++    select: { id: true, title: true, releaseDate: true },
++    orderBy: { createdAt: "asc" },
++    take: limit
++  });
++
++  const summary = {
++    checked: movies.length,
++    created: 0,
++    updated: 0,
++    notFound: 0,
++    failed: 0,
++    stoppedEarly: null
++  };
++
++  for (const movie of movies) {
++    if (dryRun) {
++      log(`[dry run] would look up: ${movie.title} (${releaseYearOf(movie) ?? "year unknown"})`);
++      continue;
++    }
++
++    try {
++      const result = await importTrailerForMovie(db, movie);
++      if (result.status === "created") summary.created += 1;
++      else if (result.status === "updated") summary.updated += 1;
++      else if (result.status === "not_found") summary.notFound += 1;
++      log(`${movie.title}: ${result.status}`);
++    } catch (error) {
++      if (error instanceof TmdbError) {
++        summary.failed += 1;
++        log(`${movie.title}: TMDB problem (${error.code})`);
++        if (["NO_API_KEY", "AUTH_FAILED", "RATE_LIMITED"].includes(error.code)) {
++          summary.stoppedEarly = error.code;
++          break;
++        }
++      } else {
++        throw error;
++      }
++    }
++
++    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
++  }
++
++  return summary;
++}
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/backend/tests/trailer.test.js filmora/backend/tests/trailer.test.js
+--- orig/backend/tests/trailer.test.js	1970-01-01 00:00:00.000000000 +0000
++++ filmora/backend/tests/trailer.test.js	2026-11-11 10:42:01.442687985 +0000
+@@ -0,0 +1,201 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++// env.js validates these when it is imported, so set them first.
++process.env.DATABASE_URL ||= "postgresql://x:x@localhost:5432/x";
++process.env.SESSION_SECRET ||= "test-secret-test-secret-test-secret-123";
++process.env.TMDB_API_KEY = "test-key";
++
++const { getMovieTrailer, clearTrailerCache, TmdbError } = await import("../src/services/tmdb.service.js");
++const { importTrailerForMovie, backfillMissingTrailers } = await import("../src/services/trailer.service.js");
++const { serializeMovie } = await import("../src/services/catalog.service.js");
++
++const realFetch = globalThis.fetch;
++let calls = [];
++
++// Fake TMDB. "routes" maps a URL path to a response body or a status number.
++function fakeTmdb(routes) {
++  calls = [];
++  globalThis.fetch = async (url) => {
++    const u = new URL(url);
++    calls.push(u.pathname + u.search);
++    const handler = routes[u.pathname];
++    const body = typeof handler === "function" ? handler(u) : handler;
++    if (typeof body === "number") {
++      return new Response("{}", { status: body, headers: { "retry-after": "7" } });
++    }
++    return new Response(JSON.stringify(body ?? {}), { status: 200 });
++  };
++}
++
++test.beforeEach(() => clearTrailerCache());
++test.after(() => { globalThis.fetch = realFetch; });
++
++const video = (o) => ({ site: "YouTube", official: true, type: "Trailer", key: "abcdefghijk", name: "T", size: 1080, published_at: "2024-01-01", ...o });
++
++test("finds the movie and returns a YouTube embed URL", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Dune", release_date: "2021-10-22" }] },
++    "/3/movie/1/videos": { results: [video({ key: "n9xhJrPXop4" })] }
++  });
++  const t = await getMovieTrailer("Dune", 2021);
++  assert.equal(t.url, "https://www.youtube.com/embed/n9xhJrPXop4");
++  assert.ok(!JSON.stringify(calls).includes("undefined"));
++});
++
++test("does not accept a wrong movie with a different title or year", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [
++      { id: 2, title: "Dune", release_date: "1984-12-14" },
++      { id: 3, title: "Dune: Part Two", release_date: "2024-02-27" }
++    ] },
++    "/3/movie/2/videos": { results: [video({})] },
++    "/3/movie/3/videos": { results: [video({})] }
++  });
++  assert.equal(await getMovieTrailer("Dune", 2021), null);
++  assert.ok(!calls.some((c) => c.includes("/videos")), "must not fetch videos for a wrong match");
++});
++
++test("prefers official Trailer over Teaser, ignores unofficial and non-YouTube", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [
++      video({ type: "Teaser", key: "teaser00001" }),
++      video({ official: false, key: "unoffic0001" }),
++      video({ site: "Vimeo", key: "vimeo000001" }),
++      video({ key: "good0000001" })
++    ] }
++  });
++  assert.equal((await getMovieTrailer("Film", 2020)).key, "good0000001");
++});
++
++test("falls back to an official Teaser when there is no official Trailer", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [video({ type: "Teaser", key: "teaser00001" }), video({ type: "Clip" })] }
++  });
++  assert.equal((await getMovieTrailer("Film", 2020)).type, "Teaser");
++});
++
++test("rejects video keys that are not valid YouTube ids", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [video({ key: "x\"><script>" })] }
++  });
++  assert.equal(await getMovieTrailer("Film", 2020), null);
++});
++
++test("returns null when there are no videos", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [] }
++  });
++  assert.equal(await getMovieTrailer("Film", 2020), null);
++});
++
++test("caches results so TMDB is not asked twice", async () => {
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [video({})] }
++  });
++  await getMovieTrailer("Film", 2020);
++  const first = calls.length;
++  await getMovieTrailer("Film", 2020);
++  assert.equal(calls.length, first);
++});
++
++test("rate limit becomes a TmdbError and is not cached", async () => {
++  fakeTmdb({ "/3/search/movie": 429 });
++  await assert.rejects(() => getMovieTrailer("Film", 2020),
++    (e) => e instanceof TmdbError && e.code === "RATE_LIMITED" && e.retryAfterSeconds === 7);
++  fakeTmdb({
++    "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++    "/3/movie/1/videos": { results: [video({})] }
++  });
++  assert.ok(await getMovieTrailer("Film", 2020));
++});
++
++test("network failure becomes a TmdbError without leaking the API key", async () => {
++  globalThis.fetch = async () => { throw new Error("connect ECONNREFUSED ?api_key=test-key"); };
++  await assert.rejects(() => getMovieTrailer("Film", 2020),
++    (e) => e.code === "NETWORK" && !e.message.includes("test-key"));
++});
++
++// ---------- saving into MovieMedia (fake database) ----------
++function fakeDb(initialMedia = []) {
++  const media = [...initialMedia];
++  return {
++    media,
++    movieMedia: {
++      findFirst: async ({ where }) => media.find((m) => m.movieId === where.movieId && m.mediaType === where.mediaType) || null,
++      create: async ({ data }) => { media.push({ id: `m${media.length + 1}`, ...data }); },
++      update: async ({ where, data }) => Object.assign(media.find((m) => m.id === where.id), data)
++    }
++  };
++}
++const goodTmdb = () => fakeTmdb({
++  "/3/search/movie": { results: [{ id: 1, title: "Film", release_date: "2020-05-01" }] },
++  "/3/movie/1/videos": { results: [video({ key: "good0000001" })] }
++});
++const movie = { id: "mov-1", title: "Film", releaseDate: new Date("2020-05-01") };
++
++test("creates a trailer row when missing", async () => {
++  goodTmdb();
++  const db = fakeDb();
++  assert.equal((await importTrailerForMovie(db, movie)).status, "created");
++  assert.equal(db.media.length, 1);
++  assert.equal(db.media[0].movieId, "mov-1");
++  assert.equal(db.media[0].fileUrl, "https://www.youtube.com/embed/good0000001");
++});
++
++test("updates (never duplicates) an existing trailer when overwrite is requested", async () => {
++  goodTmdb();
++  const db = fakeDb([{ id: "m1", movieId: "mov-1", mediaType: "trailer", fileUrl: "https://www.youtube.com/embed/old00000000" }]);
++  assert.equal((await importTrailerForMovie(db, movie, { overwrite: true })).status, "updated");
++  assert.equal(db.media.length, 1);
++  assert.equal(db.media[0].fileUrl, "https://www.youtube.com/embed/good0000001");
++});
++
++test("keeps an existing trailer and makes no TMDB request by default", async () => {
++  goodTmdb();
++  const db = fakeDb([{ id: "m1", movieId: "mov-1", mediaType: "trailer", fileUrl: "https://www.youtube.com/embed/old00000000" }]);
++  assert.equal((await importTrailerForMovie(db, movie)).status, "skipped_existing");
++  assert.equal(calls.length, 0);
++});
++
++test("backfill stops early when TMDB rejects the key and never throws", async () => {
++  fakeTmdb({ "/3/search/movie": 401 });
++  const db = { ...fakeDb(), movie: { findMany: async () => [movie, { ...movie, id: "mov-2" }] } };
++  const summary = await backfillMissingTrailers(db, { delayMs: 0 });
++  assert.equal(summary.stoppedEarly, "AUTH_FAILED");
++  assert.equal(summary.failed, 1);
++});
++
++test("a missing TMDB key gives a clear NO_API_KEY error and makes no request", async () => {
++  const { env } = await import("../src/config/env.js");
++  const saved = env.TMDB_API_KEY;
++  env.TMDB_API_KEY = "";
++  fakeTmdb({});
++  try {
++    await assert.rejects(() => getMovieTrailer("Film", 2020), (e) => e.code === "NO_API_KEY");
++    assert.equal(calls.length, 0);
++  } finally {
++    env.TMDB_API_KEY = saved;
++  }
++});
++
++// ---------- public API safety ----------
++test("public movie output returns trailerUrl and never private storage details", () => {
++  const out = serializeMovie({
++    id: "1", title: "Film", slug: "film",
++    media: [{ mediaType: "trailer", fileUrl: "https://www.youtube.com/embed/good0000001", storageKey: "secret" }],
++    videoAssets: [{ providerVideoUid: "CLOUDFLARE-SECRET" }]
++  });
++  assert.equal(out.trailerUrl, "https://www.youtube.com/embed/good0000001");
++  assert.ok(!JSON.stringify(out).includes("CLOUDFLARE-SECRET"));
++  assert.ok(!JSON.stringify(out).includes("secret"));
++});
++
++test("movie without a trailer gives trailerUrl: null", () => {
++  assert.equal(serializeMovie({ id: "1", title: "F", slug: "f", media: [] }).trailerUrl, null);
++});
+diff -ruN '--exclude=node_modules' '--exclude=.env' orig/frontend/js/admin.js filmora/frontend/js/admin.js
+--- orig/frontend/js/admin.js	2026-11-11 10:40:43.662844874 +0000
++++ filmora/frontend/js/admin.js	2026-11-11 10:41:28.093742153 +0000
+@@ -97,6 +97,12 @@
+ 
+     actions.append(actionButton("Edit details", "button-outline", async () => openEdit(movie)));
+ 
++    actions.append(actionButton("Fetch trailer", "button-outline", async () => {
++      await api(`/api/admin/movies/${movie.id}/tmdb-trailer`, { method: "POST", body: "{}" });
++      await loadMovies();
++      message.textContent = "Official trailer imported from TMDB.";
++    }));
++
+     if (movie.publicationStatus === "PUBLISHED") {
+       actions.append(actionButton("Unpublish", "button-outline", async () => {
+         await api(`/api/admin/movies/${movie.id}/unpublish`, { method: "PATCH", body: "{}" });

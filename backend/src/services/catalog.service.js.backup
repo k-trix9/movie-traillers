@@ -1,0 +1,40 @@
+import { env } from "../config/env.js";
+/**
+ * Public catalogue: only show published movies
+ * with a verified, valid distribution licence
+ * covering the visitor's territory.
+ *
+ * Country headers are trusted only when the API
+ * is protected behind Cloudflare.
+ */
+export function publicCatalogueWhere(req, extra = {}) {
+  const now = new Date();
+
+  const headerCountry = env.TRUST_CF_IP_COUNTRY
+    ? String(req.get("cf-ipcountry") || "").toUpperCase()
+    : "";
+
+  const countryCode =
+    /^[A-Z]{2}$/.test(headerCountry) && headerCountry !== "XX"
+      ? headerCountry
+      : "";
+
+  return {
+    ...extra,
+    publicationStatus: "PUBLISHED",
+    licenses: {
+      some: {
+        status: "VERIFIED",
+        permittedDistribution: true,
+        territory: countryCode
+          ? { in: ["WORLDWIDE", countryCode] }
+          : "WORLDWIDE",
+        validFrom: { lte: now },
+        OR: [
+          { validUntil: null },
+          { validUntil: { gte: now } }
+        ]
+      }
+    }
+  };
+}

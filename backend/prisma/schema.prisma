@@ -1,0 +1,566 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum MovieStatus {
+  DRAFT
+  PROCESSING
+  PENDING_REVIEW
+  PUBLISHED
+  UNPUBLISHED
+  ARCHIVED
+}
+
+enum VideoProcessingStatus {
+  UPLOAD_PENDING
+  UPLOADING
+  PROCESSING
+  READY
+  ERROR
+  DELETED
+}
+
+enum PlaybackStatus {
+  RESTRICTED
+  AVAILABLE
+  DISABLED
+}
+
+enum LicenseStatus {
+  PENDING
+  VERIFIED
+  REVOKED
+  EXPIRED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+model User {
+  id               String       @id @default(uuid()) @db.Uuid
+  email            String       @unique @db.VarChar(255)
+  username         String?      @unique @db.VarChar(50)
+  fullName         String?      @db.VarChar(150)
+  passwordHash     String
+  accountStatus    AccountStatus @default(ACTIVE)
+  emailVerifiedAt  DateTime?
+  preferences      UserPreference?
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens PasswordResetToken[]
+  roles            UserRole[]
+  subscriptions    Subscription[]
+  payments         Payment[]
+  watchProgress    WatchProgress[]
+  deviceSessions   DeviceSession[]
+  reportedReports  Report[] @relation("ReportCreator")
+  reviewedReports  Report[] @relation("ReportReviewer")
+  moderationActions ModerationAction[] @relation("ModerationActor")
+  watchlists       Watchlist[]
+  favorites        Favorite[]
+  reviews          Review[]
+  notifications    Notification[]
+  adminActivities  AdminActivityLog[] @relation("AdminActor")
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([accountStatus])
+  @@index([createdAt])
+}
+
+model UserPreference {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @unique @db.Uuid
+  preferredLanguage  String?  @db.VarChar(20)
+  subtitleLanguage   String?  @db.VarChar(20)
+  autoplayEnabled    Boolean  @default(true)
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  tokenHash String   @unique @db.VarChar(128)
+  expiresAt DateTime
+  usedAt    DateTime?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  tokenHash String   @unique @db.VarChar(128)
+  expiresAt DateTime
+  usedAt    DateTime?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model Role {
+  id          String           @id @default(uuid()) @db.Uuid
+  name        String           @unique @db.VarChar(50)
+  description String?
+  users       UserRole[]
+  permissions RolePermission[]
+  createdAt   DateTime         @default(now())
+}
+
+model Permission {
+  id          String           @id @default(uuid()) @db.Uuid
+  name        String           @unique @db.VarChar(80)
+  description String?
+  roles       RolePermission[]
+}
+
+model UserRole {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  roleId     String   @db.Uuid
+  assignedAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@index([roleId])
+}
+
+model RolePermission {
+  id           String     @id @default(uuid()) @db.Uuid
+  roleId       String     @db.Uuid
+  permissionId String     @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model Plan {
+  id              String      @id @default(uuid()) @db.Uuid
+  code            String      @unique @db.VarChar(40)
+  name            String      @db.VarChar(80)
+  description     String?
+  maxScreens      Int         @default(1)
+  maxResolution   String      @default("720p") @db.VarChar(20)
+  isActive        Boolean     @default(true)
+  prices          PlanPrice[]
+  subscriptions   Subscription[]
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
+
+model PlanPrice {
+  id              String         @id @default(uuid()) @db.Uuid
+  planId          String         @db.Uuid
+  currency        String         @db.VarChar(3)
+  amount          Decimal        @db.Decimal(10, 2)
+  intervalMonths  Int            @default(1)
+  isActive        Boolean        @default(true)
+  plan            Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions   Subscription[]
+  payments        Payment[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@unique([planId, currency, intervalMonths])
+  @@index([currency, isActive])
+}
+
+model Subscription {
+  id                    String             @id @default(uuid()) @db.Uuid
+  userId                String             @db.Uuid
+  planId                String             @db.Uuid
+  planPriceId           String             @db.Uuid
+  status                SubscriptionStatus @default(ACTIVE)
+  provider              String             @default("flutterwave") @db.VarChar(40)
+  providerSubscriptionRef String?          @db.VarChar(255)
+  startsAt              DateTime           @default(now())
+  currentPeriodStart    DateTime
+  currentPeriodEnd      DateTime
+  cancelAtPeriodEnd     Boolean            @default(false)
+  cancelledAt           DateTime?
+  user                  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan                  Plan               @relation(fields: [planId], references: [id], onDelete: Restrict)
+  planPrice             PlanPrice          @relation(fields: [planPriceId], references: [id], onDelete: Restrict)
+  payments              Payment[]
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  @@index([userId, status, currentPeriodEnd])
+  @@index([status, currentPeriodEnd])
+}
+
+model Payment {
+  id                    String        @id @default(uuid()) @db.Uuid
+  userId                String        @db.Uuid
+  subscriptionId        String?       @db.Uuid
+  planPriceId           String        @db.Uuid
+  provider              String        @default("flutterwave") @db.VarChar(40)
+  reference             String        @unique @db.VarChar(120)
+  providerTransactionId String?       @unique @db.VarChar(120)
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String        @db.VarChar(3)
+  status                PaymentStatus @default(PENDING)
+  checkoutUrl           String?
+  paidAt                DateTime?
+  rawProviderData       Json?
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  subscription          Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  planPrice             PlanPrice     @relation(fields: [planPriceId], references: [id], onDelete: Restrict)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+model PaymentEvent {
+  id                    String   @id @default(uuid()) @db.Uuid
+  provider              String   @db.VarChar(40)
+  eventKey              String   @unique @db.VarChar(180)
+  eventType             String   @db.VarChar(100)
+  providerTransactionId String?  @db.VarChar(120)
+  payload               Json
+  processedAt           DateTime @default(now())
+  createdAt             DateTime @default(now())
+
+  @@index([providerTransactionId])
+}
+
+model Movie {
+  id                String       @id @default(uuid()) @db.Uuid
+  title             String       @db.VarChar(255)
+  slug              String       @unique @db.VarChar(280)
+  description       String?
+  releaseDate       DateTime?
+  durationSeconds   Int?
+  ageRating         String?      @db.VarChar(20)
+  originalLanguage  String?      @db.VarChar(20)
+  publicationStatus MovieStatus  @default(DRAFT)
+  featured          Boolean      @default(false)
+  genres            MovieGenre[]
+  categories        MovieCategory[]
+  media             MovieMedia[]
+  videoAssets       VideoAsset[]
+  licenses          ContentLicense[]
+  credits           MovieCredit[]
+  tracks            MovieTrack[]
+  reports           Report[]
+  watchProgress     WatchProgress[]
+  watchlistItems    WatchlistItem[]
+  favorites         Favorite[]
+  reviews           Review[]
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([publicationStatus, featured])
+  @@index([title])
+}
+
+model Genre {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String       @unique @db.VarChar(80)
+  slug      String       @unique @db.VarChar(100)
+  movies    MovieGenre[]
+  createdAt DateTime     @default(now())
+}
+
+model MovieGenre {
+  id      String @id @default(uuid()) @db.Uuid
+  movieId String @db.Uuid
+  genreId String @db.Uuid
+  movie   Movie  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  genre   Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@unique([movieId, genreId])
+  @@index([genreId])
+}
+
+model Category {
+  id          String          @id @default(uuid()) @db.Uuid
+  name        String          @unique @db.VarChar(80)
+  slug        String          @unique @db.VarChar(100)
+  description String?
+  isActive    Boolean         @default(true)
+  movies      MovieCategory[]
+  createdAt   DateTime        @default(now())
+}
+
+model MovieCategory {
+  id           String   @id @default(uuid()) @db.Uuid
+  movieId      String   @db.Uuid
+  categoryId   String   @db.Uuid
+  displayOrder Int      @default(0)
+  movie        Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  category     Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([movieId, categoryId])
+  @@index([categoryId, displayOrder])
+}
+
+
+model Person {
+  id           String        @id @default(uuid()) @db.Uuid
+  fullName     String        @db.VarChar(180)
+  biography    String?
+  profileImage String?
+  birthDate    DateTime?
+  credits      MovieCredit[]
+  createdAt    DateTime      @default(now())
+
+  @@index([fullName])
+}
+
+model MovieCredit {
+  id            String   @id @default(uuid()) @db.Uuid
+  movieId       String   @db.Uuid
+  personId      String   @db.Uuid
+  roleType      String   @db.VarChar(40)
+  characterName String?  @db.VarChar(180)
+  displayOrder  Int      @default(0)
+  movie         Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  person        Person   @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([movieId, personId, roleType])
+  @@index([personId, roleType])
+}
+
+model MovieTrack {
+  id              String   @id @default(uuid()) @db.Uuid
+  movieId         String   @db.Uuid
+  trackType       String   @db.VarChar(20)
+  language        String   @db.VarChar(20)
+  label           String?  @db.VarChar(100)
+  providerTrackId String?  @db.VarChar(180)
+  fileUrl         String?
+  isDefault       Boolean  @default(false)
+  movie           Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now())
+
+  @@index([movieId, trackType, language])
+}
+
+model MovieMedia {
+  id              String   @id @default(uuid()) @db.Uuid
+  movieId         String   @db.Uuid
+  mediaType       String   @db.VarChar(30)
+  storageProvider String   @default("external") @db.VarChar(30)
+  storageKey      String?
+  fileUrl         String?
+  movie           Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now())
+
+  @@index([movieId, mediaType])
+}
+
+model VideoAsset {
+  id                 String                @id @default(uuid()) @db.Uuid
+  movieId            String                @db.Uuid
+  provider           String                @default("cloudflare_stream") @db.VarChar(40)
+  providerVideoUid   String                @unique @db.VarChar(80)
+  processingStatus   VideoProcessingStatus @default(UPLOAD_PENDING)
+  playbackStatus     PlaybackStatus        @default(RESTRICTED)
+  durationSeconds    Int?
+  sizeBytes          BigInt?
+  readyAt            DateTime?
+  movie              Movie                 @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+
+  @@index([movieId, processingStatus])
+}
+
+model ContentLicense {
+  id                   String        @id @default(uuid()) @db.Uuid
+  movieId              String        @db.Uuid
+  licenseReference     String        @db.VarChar(180)
+  rightsHolder         String        @db.VarChar(180)
+  territory            String        @db.VarChar(20)
+  validFrom            DateTime
+  validUntil           DateTime?
+  permittedDistribution Boolean      @default(false)
+  status               LicenseStatus @default(PENDING)
+  verificationNotes   String?
+  movie                Movie         @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  @@index([movieId, status, territory])
+  @@index([validFrom, validUntil])
+}
+
+
+model DeviceSession {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  sessionId  String    @db.VarChar(80)
+  playerSessionId String @db.VarChar(80)
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime  @default(now())
+
+  @@unique([userId, sessionId, playerSessionId])
+  @@index([userId, sessionId, lastSeenAt, revokedAt])
+  @@index([userId, lastSeenAt, revokedAt])
+}
+
+model WatchProgress {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @db.Uuid
+  movieId         String   @db.Uuid
+  positionSeconds Int      @default(0)
+  lastWatchedAt   DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie           Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId])
+  @@index([userId, lastWatchedAt])
+}
+
+model Watchlist {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String         @db.Uuid
+  name      String         @default("My List") @db.VarChar(80)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     WatchlistItem[]
+  createdAt DateTime       @default(now())
+
+  @@unique([userId, name])
+}
+
+model WatchlistItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  watchlistId String   @db.Uuid
+  movieId     String   @db.Uuid
+  watchlist   Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  movie       Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([watchlistId, movieId])
+}
+
+model Favorite {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  movieId   String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie     Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, movieId])
+}
+
+model Review {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  movieId   String   @db.Uuid
+  rating    Int
+  comment   String?
+  isVisible Boolean  @default(false)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie     Movie    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, movieId])
+  @@index([movieId, isVisible])
+}
+
+
+model Report {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @db.Uuid
+  movieId       String?   @db.Uuid
+  reason        String    @db.VarChar(100)
+  details       String?
+  status        String    @default("OPEN") @db.VarChar(30)
+  reviewedById  String?   @db.Uuid
+  reviewedAt    DateTime?
+  reportedBy    User      @relation("ReportCreator", fields: [userId], references: [id], onDelete: Cascade)
+  movie         Movie?    @relation(fields: [movieId], references: [id], onDelete: SetNull)
+  reviewedBy    User?     @relation("ReportReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  createdAt     DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([movieId])
+}
+
+model ModerationAction {
+  id          String   @id @default(uuid()) @db.Uuid
+  moderatorId String   @db.Uuid
+  action      String   @db.VarChar(100)
+  entityType  String   @db.VarChar(80)
+  entityId    String?  @db.VarChar(100)
+  notes       String?
+  moderator   User     @relation("ModerationActor", fields: [moderatorId], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now())
+
+  @@index([moderatorId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  title     String   @db.VarChar(160)
+  message   String
+  readAt    DateTime?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt, createdAt])
+}
+
+model AdminActivityLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  adminUserId String   @db.Uuid
+  action      String   @db.VarChar(100)
+  entityType  String   @db.VarChar(80)
+  entityId    String?  @db.VarChar(100)
+  metadata    Json?
+  admin       User     @relation("AdminActor", fields: [adminUserId], references: [id], onDelete: Restrict)
+  createdAt   DateTime @default(now())
+
+  @@index([adminUserId, createdAt])
+  @@index([entityType, entityId])
+}
+model UserSession {
+  sid    String   @id(map: "session_pkey") @db.VarChar
+  sess   Json     @db.Json
+  expire DateTime @db.Timestamp(6)
+
+  @@index([expire], map: "IDX_session_expire")
+  @@map("user_sessions")
+  @@ignore
+}
